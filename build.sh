@@ -1,0 +1,463 @@
+#!/bin/bash#==========================Set up the environment#==========================
+set -e                  # exit on error
+set -o pipefail         # exit on pipeline error
+set -u                  # treat unset variable as error
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+export SCRIPT_DIRsource "$SCRIPT_DIR/shared.sh"
+source "$SCRIPT_DIR/args.sh"Do NOT derive this label from TARGET_NAME. Rufus ISO mode replaces the oldvolume-label substring across matching boot command lines, not just CDLABELvalues. With label "agnusos", FAT label uppercasing also turnsrd.agnusos.live=1 into rd.AGNUSOS.live=1. Our case-sensitive Live hooks thenskip BOTH media verification and Live-user setup, leaving a GDM login prompt."AGNUSOS" alone is not sufficient: a custom USB label would also rewriteAGNUSOS-PERSIST. Keep the media label distinct from parameter names and thepersistence label; changing the USB label must only change media references.Regression coverage: make test TEST_ARGS="--live-usb-only --no-tui".LIVE_MEDIA_LABEL="AOS_LIVE"Map Debian arch name to GRUB target name (amd64 -> x86_64, arm64 -> arm64)case "$TARGET_ARCH" in
+amd64) GRUB_EFI_TARGET="x86_64-efi" ;;
+arm64) GRUB_EFI_TARGET="arm64-efi" ;;
+*)
+print_error "Unsupported target architecture: $TARGET_ARCH"
+exit 1
+;;
+esacfunction bind_signal() {
+print_ok "Bind signal..."
+trap umount_on_exit EXIT
+judge "Bind signal"
+}function clean() {
+print_ok "Cleaning up previous build..."
+sudo umount new_building_os/sys || sudo umount -lf new_building_os/sys || true
+sudo umount new_building_os/proc || sudo umount -lf new_building_os/proc || true
+sudo umount new_building_os/dev || sudo umount -lf new_building_os/dev || true
+sudo umount new_building_os/run || sudo umount -lf new_building_os/run || true
+sudo rm -rf new_building_os image || true
+judge "Clean up build artifacts"
+}function download_base_system() {
+print_ok "Creating new_building_os directory..."
+sudo mkdir -p new_building_os
+judge "Create build directory"print_ok "Calling debootstrap to download base system (arch: $TARGET_ARCH)..."
+sudo debootstrap --arch="$TARGET_ARCH" --variant=minbase \
+    --include=ca-certificates,wget,dbus \
+    "$TARGET_UBUNTU_VERSION" new_building_os "$APT_SOURCE"
+judge "Download base system"
+}function mount_folders() {
+print_ok "Reloading systemd daemon..."
+sudo systemctl daemon-reload
+judge "Reload systemd daemon"print_ok "Mounting /dev /run from host to build dir..."
+sudo mount --bind /dev new_building_os/dev
+sudo mount --bind /run new_building_os/run
+judge "Mount /dev /run"
+
+print_ok "Mounting /proc /sys /dev/pts within chroot..."
+sudo chroot new_building_os mount none -t proc /proc
+sudo chroot new_building_os mount none -t sysfs /sys
+sudo chroot new_building_os mount none -t devpts /dev/pts
+judge "Mount /proc /sys /dev/pts"
+
+print_ok "Copying mods to chroot /root/mods..."
+sudo cp -r "$SCRIPT_DIR/mods" new_building_os/root/mods
+sudo cp "$SCRIPT_DIR/args.sh" new_building_os/root/mods/args.sh
+sudo cp "$SCRIPT_DIR/shared.sh" new_building_os/root/mods/shared.sh
+}function setup_apt() {
+print_ok "Setting up Ubuntu apt sources in chroot..."
+sudo mkdir -p new_building_os/etc/apt/sources.list.d
+sudo tee new_building_os/etc/apt/sources.list.d/ubuntu.sources > /dev/null <<EOF
+Types: deb
+URIs: $APT_SOURCE
+Suites: $TARGET_UBUNTU_VERSION
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpgTypes: deb
+URIs: $APT_SOURCE
+Suites: $TARGET_UBUNTU_VERSION-updates
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpgTypes: deb
+URIs: $APT_SOURCE
+Suites: $TARGET_UBUNTU_VERSION-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpgTypes: deb
+URIs: $APT_SOURCE
+Suites: $TARGET_UBUNTU_VERSION-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+judge "Set up Ubuntu apt sources"# Remove stale legacy-format sources.list (debootstrap artifact).
+# Ubuntu 24.04+ uses deb822 .sources files in sources.list.d/ instead.
+sudo rm -f new_building_os/etc/apt/sources.list
+
+# O servidor APKG foi desativado para garantir a independencia do agnusOS.
+print_ok "Servidor APKG externo ignorado. Utilizando apenas repositorios oficiais."
+
+print_ok "Enabling apt recommends in chroot..."
+echo 'APT::Install-Recommends "true";' | sudo tee new_building_os/etc/apt/apt.conf.d/99-enable-recommends > /dev/null
+judge "Enable apt recommends"
+
+print_ok "Running apt update in chroot..."
+sudo chroot new_building_os apt update
+judge "Apt update in chroot"
+
+# Upgrade base system BEFORE mods run. Swap packages (mod 01)
+# must not be visible to this upgrade — apt would try to
+# "normalize" them back to Ubuntu's lower version and fail.
+print_ok "Upgrading base system packages..."
+sudo chroot new_building_os apt -y upgrade
+judge "Upgrade base system"
+}function run_chroot() {
+print_ok "Running install_all_mods.sh in new_building_os..."
+print_warn ""
+print_warn "   The following will run in chroot ENV!"
+print_warn ""
+sudo chroot new_building_os /usr/bin/env DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-readline} /root/mods/install_all_mods.sh -
+print_warn ""
+print_warn "   chroot ENV execution completed!"
+print_warn ""
+judge "Run install_all_mods.sh in new_building_os"print_ok "Sleeping for 5 seconds to allow chroot to exit cleanly..."
+sleep 5
+}function umount_folders() {
+print_ok "Cleaning mods from chroot /root/mods..."
+sudo rm -rf new_building_os/root/mods
+judge "Clean up chroot /root/mods"print_ok "Unmounting /proc /sys /dev/pts within chroot..."
+sudo chroot new_building_os umount /dev/pts || sudo chroot new_building_os umount -lf /dev/pts
+sudo chroot new_building_os umount /sys || sudo chroot new_building_os umount -lf /sys
+sudo chroot new_building_os umount /proc || sudo chroot new_building_os umount -lf /proc
+judge "Unmount /proc /sys /dev/pts"
+
+print_ok "Unmounting /dev /run outside of chroot..."
+sudo umount new_building_os/dev || sudo umount -lf new_building_os/dev
+sudo umount new_building_os/run || sudo umount -lf new_building_os/run
+judge "Unmount /dev /run"
+}function prepare_iso_directory() {
+print_ok "Creating image directory..."
+sudo rm -rf image
+mkdir -p image/{LiveOS,isolinux,.disk}
+judge "Create image directory"
+}function prepare_live_grub_font() {
+print_ok "Generating BIOS Unicode font for the Live ISO..."
+mkdir -p image/isolinux image/boot/grub/fonts
+grub-mkfont --size="16" --output="image/isolinux/agnusos-unicode-16.pf2" "/usr/share/fonts/opentype/unifont/unifont.otf"
+cp "image/isolinux/agnusos-unicode-16.pf2" "image/boot/grub/fonts/agnusos-unicode-16.pf2"
+judge "Prepare readable Live GRUB font"
+}function prepare_live_grub_theme() {
+# Aponta para o futuro tema do agnusOS
+local source_dir="new_building_os/usr/share/grub/themes/agnusos-theme"
+if [ ! -s "$source_dir/theme.txt" ] || [ ! -s "$source_dir/background.png" ] \vert{}\vert{} [ ! -s "$source_dir/live-grub.cfg" ]; then
+print_warn "Tema do GRUB nao encontrado ou incompleto em: $source_dir"
+print_warn "Ignorando a copia do tema. O GRUB usara a interface padrao baseada em texto ate que os arquivos sejam criados."
+else
+mkdir -p image/boot/grub/themes
+cp -r "$source_dir" image/boot/grub/themes/
+judge "Copy packaged GRUB theme to Live ISO"
+fi
+}function generate_live_grub_config() {
+local try_text="Try or Install $TARGET_BUSINESS_NAME"
+local togo_text="$TARGET_BUSINESS_NAME To Go (Persistent on USB)"
+# Our Live checker owns media verification; do not enable rd.live.check.
+local live_boot_args="root=live:CDLABEL=$LIVE_MEDIA_LABEL rd.live.dir=LiveOS rd.live.squashimg=rootfs.squashfs rd.overlay rd.agnusos.live=1"
+local regional_entries=""
+local region_count=0
+local code label timezone keyboard extra# The Live region is only a boot-time default; it does not constrain the installer.
+while IFS='|' read -r code label timezone keyboard extra; do
+    [[ -n $code ]] || continue
+    if [[ -z $label \vert{}\vert{} -z$timezone || -z $keyboard \vert{}\vert{} -n$extra ]]; then
+        printf 'Invalid Live regional policy entry: %s\n' "$code" >&2
+        return 1
+    fi
+    case "$code:$timezone:$keyboard" in
+        *[!A-Za-z0-9_+./:@-]*)
+            printf 'Unsafe Live regional policy entry: %s\n' "$code" >&2
+            return 1
+            ;;
+    esac
+    case "$label" in
+        *\"*|*\\*|*\$*)
+            printf 'Unsafe Live GRUB label: %s\n' "$label" >&2
+            return 1
+            ;;
+    esac
+    region_count=$((region_count + 1))
+    regional_entries="$regional_entries
+menuentry \"$label\" --class lang {
+    set gfxpayload=auto
+    linux   /LiveOS/vmlinuz $live_boot_args locale=$code.UTF-8 timezone=$timezone systemd.timezone=$timezone rd.agnusos.keyboard=$keyboard quiet splash ---
+    initrd  /LiveOS/initrd
+}"
+done <<< "$SUPPORTED_LIVE_REGIONS"
+if ((region_count != 28)); then
+    printf 'Live regional policy must contain exactly 28 entries\n' >&2
+    return 1
+fi
+
+cat <<EOF
+search --set=root --file /$TARGET_NAMEMatch the installed system: let GRUB and the firmware choose the display mode.set gfxmode=auto
+insmod all_video
+insmod gfxterm
+insmod font
+set theme_font_ready=0
+if loadfont unicode ; then
+set theme_font_ready=1
+terminal_output gfxterm
+elif loadfont /boot/grub/fonts/agnusos-unicode-16.pf2 ; then
+set theme_font_ready=1
+terminal_output gfxterm
+elif loadfont /isolinux/agnusos-unicode-16.pf2 ; then
+set theme_font_ready=1
+terminal_output gfxterm
+fi
+if [ -f /boot/grub/themes/agnusos-theme/live-grub.cfg ]; then
+source /boot/grub/themes/agnusos-theme/live-grub.cfg
+fiset default="0"
+set timeout=10submenu "$try_text" --class agnusos {
+$regional_entries
+}submenu "Advanced Options..." --class recovery {
+menuentry "$try_text (Safe Graphics)" --class driver {
+set gfxpayload=auto
+linux   /LiveOS/vmlinuz $live_boot_args nomodeset ---
+initrd  /LiveOS/initrd
+}
+menuentry "$togo_text" --class agnusos {
+# Optical media cannot hold a writable persistence partition.
+insmod regexp
+if regexp '^cd[0-9]+$' "$root"; then
+clear
+echo '$TARGET_BUSINESS_NAME To Go requires a USB drive written in DD mode with unallocated space after the image.'
+echo 'This boot medium is not supported. Powering off in 15 seconds.'
+sleep 15
+insmod halt
+halt
+fi
+set gfxpayload=auto
+linux   /LiveOS/vmlinuz root=live:CDLABEL=$LIVE_MEDIA_LABEL rd.live.dir=LiveOS rd.live.squashimg=rootfs.squashfs rd.overlay=LABEL=AGNUSOS-PERSIST rd.live.overlay.cowfs=ext4 rd.agnusos.live=1 quiet splash ---
+initrd  /LiveOS/initrd
+}
+}if [ "$grub_platform" == "efi" ]; then
+menuentry "Boot from next volume" --class find.efi {
+exit 1
+}
+menuentry "UEFI Firmware Settings" --class efi {
+fwsetup
+}
+fi
+EOF
+}function build_iso() {
+print_ok "Building ISO image..."# Copy the kernel and the separately-built non-host-only Live initrd.
+print_ok "Copying the Dracut Live boot artifacts to /LiveOS..."
+# Resolve the distro-maintained symlinks — they always point to the
+# current kernel, so we never pick a stale one left behind by apt.
+REAL_VMLINUZ=$(readlink -f new_building_os/vmlinuz 2>/dev/null)
+[ -f "$REAL_VMLINUZ" ] \vert{}\vert{} REAL_VMLINUZ=$(readlink -f new_building_os/boot/vmlinuz 2>/dev/null)
+REAL_INITRD="new_building_os/boot/agnusos-live-initrd.img"
+sudo cp "$REAL_VMLINUZ" image/LiveOS/vmlinuz
+sudo cp "$REAL_INITRD" image/LiveOS/initrd
+judge "Copy kernel files"
+
+print_ok "Generating grub.cfg..."
+touch "image/$TARGET_NAME"
+cp "$SCRIPT_DIR/args.sh" "image/$TARGET_NAME"
+judge "Copy build args to disk"
+
+generate_live_grub_config > image/isolinux/grub.cfg
+judge "Generate grub.cfg"
+
+
+# generate manifest
+print_ok "Generating manifest for filesystem..."
+sudo chroot new_building_os dpkg-query -W --showformat='${Package}${Version}\n' | sudo tee image/LiveOS/filesystem.manifest >/dev/null 2>&1
+judge "Generate manifest for filesystem"
+
+print_ok "Compressing the single root filesystem as /LiveOS/rootfs.squashfs..."
+sudo mksquashfs new_building_os image/LiveOS/rootfs.squashfs \
+    -noappend -no-duplicates -no-recovery \
+    -wildcards -b 1M \
+    -comp zstd -Xcompression-level 19 \
+    -e "var/cache/apt/archives/*" \
+    -e "tmp/*" \
+    -e "tmp/.*" \
+    -e "boot/agnusos-live-initrd.img" \
+    -e "swapfile"
+judge "Compress rootfs"
+
+print_ok "Generating filesystem.size on /LiveOS/filesystem.size..."
+filesystem_size=$(sudo du -sx --block-size=1 new_building_os | cut -f1)
+printf '%s\n' "$filesystem_size" > image/LiveOS/filesystem.size
+judge "Generate filesystem.size"
+
+print_ok "Generating README.diskdefines..."
+cat << EOF > image/README.diskdefines
+#define DISKNAME  Try $TARGET_BUSINESS_NAME
+#define TYPE  binary
+#define TYPEbinary  1
+#define ARCH  $TARGET_ARCH
+#define ARCH${TARGET_ARCH}  1
+#define DISKNUM  1
+#define DISKNUM1  1
+#define TOTALNUM  0
+#define TOTALNUM0  1
+EOF
+judge "Generate README.diskdefines"DATE=$(TZ="UTC" date +"%y%m%d%H%M")
+cat << EOF > image/README.md
+$TARGET_BUSINESS_NAME$TARGET_BUILD_VERSION$TARGET_BUSINESS_NAME is a custom Ubuntu-based Linux distribution that offers a familiar and easy-to-use experience for anyone moving to Linux.This image is built with the following configurations:Version: $TARGET_BUILD_VERSIONDate: $DATE$TARGET_BUSINESS_NAME is distributed under the GPLv3 license. You can find the license at GPL-v3.Please verify the checksum!!!To verify the integrity of the image, you can calculate the md5sum of the image and compare it with the value in the file `md5sum.txt`.To do this, run the following command in the terminal:```bash
+md5sum -c md5sum.txt | grep -v 'OK'
+```No output indicates that the image is correct.How to usePress F12 to enter the boot menu when you start your computer. Select the USB drive to boot from.
+EOFpushd image
+print_ok "Creating EFI boot image on /isolinux/efiboot.img..."
+(
+    cd isolinux
+    dd if=/dev/zero of=efiboot.img bs=1M count=10
+    mkfs.vfat efiboot.img
+
+    if [ "$TARGET_ARCH" = arm64 ]; then
+        target_root="$SCRIPT_DIR/new_building_os"
+        arm64_shim="$target_root/usr/lib/shim/shimaa64.efi.signed.latest"
+        arm64_grub="$target_root/usr/lib/grub/arm64-efi-signed/gcdaa64.efi.signed"
+        arm64_mok="$target_root/usr/lib/shim/mmaa64.efi"
+
+        # The signed Canonical config-delivery GRUB image already embeds
+        # FAT, ISO9660, GPT, search and configfile support. Build the
+        # removable-media ESP directly from the completed ARM64 target;
+        # this avoids installing a foreign shim package that conflicts
+        # with an amd64 build host's own bootloader.
+        cat > arm64-grub.cfg <<EOF
+search --no-floppy --label --set=agnusos_iso $LIVE_MEDIA_LABEL
+set prefix=($agnusos_iso)/boot/grub
+configfile $prefix/grub.cfg
+EOF
+printf 'shimaa64.efi,%s,,This is the boot entry for %s\n' "$TARGET_BUSINESS_NAME" "$TARGET_BUSINESS_NAME" | iconv -f UTF-8 -t UTF-16LE > BOOTAA64.CSV        mmd -i efiboot.img ::/EFI ::/EFI/BOOT
+        mcopy -i efiboot.img "$arm64_shim" ::/EFI/BOOT/BOOTAA64.EFI
+        mcopy -i efiboot.img "$arm64_grub" ::/EFI/BOOT/grubaa64.efi
+        mcopy -i efiboot.img "$arm64_mok" ::/EFI/BOOT/mmaa64.efi
+        mcopy -i efiboot.img BOOTAA64.CSV ::/EFI/BOOT/BOOTAA64.CSV
+        mcopy -i efiboot.img arm64-grub.cfg ::/EFI/BOOT/grub.cfg
+        rm -f BOOTAA64.CSV arm64-grub.cfg
+    else
+        mkdir efi boot
+        sudo mount efiboot.img efi
+        if ! sudo grub-install \
+            --target="$GRUB_EFI_TARGET" \
+            --efi-directory=efi \
+            --boot-directory=boot \
+            --uefi-secure-boot \
+            --removable \
+            --no-nvram; then
+            sudo umount efi
+            print_error "grub-install failed!"
+            exit 1
+        fi
+        sudo umount efi
+        rm -rf efi
+    fi
+)
+judge "Create EFI boot image"
+
+# BIOS boot image — amd64-only.  ARM64 machines are pure UEFI.
+if [ "$TARGET_ARCH" = "amd64" ]; then
+    print_ok "Creating BIOS boot image on /isolinux/bios.img..."
+    grub-mkstandalone \
+        --format=i386-pc \
+        --output=isolinux/core.img \
+        --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls font gfxterm gfxmenu png all_video" \
+        --modules="linux16 linux normal iso9660 biosdisk search font gfxterm gfxmenu png all_video" \
+        --locales="" \
+        --fonts="" \
+        "boot/grub/grub.cfg=isolinux/grub.cfg"
+    judge "Create BIOS boot image"
+
+    print_ok "Creating hybrid boot image on /isolinux/bios.img..."
+    cat /usr/lib/grub/i386-pc/cdboot.img isolinux/core.img > isolinux/bios.img
+    judge "Create hybrid boot image"
+fi
+
+print_ok "Creating .disk/info..."
+echo "$TARGET_BUSINESS_NAME $TARGET_BUILD_VERSION$TARGET_UBUNTU_VERSION - Release $TARGET_ARCH ($(date +%Y%m%d))" | sudo tee .disk/info
+judge "Create .disk/info"
+
+print_ok "Creating md5sum.txt..."
+# ISO-mode writers legitimately rewrite this config's volume references.
+# Hashing it here would falsely report corruption after a custom-label
+# rewrite, even with the namespace collision above fixed. Exclude only this
+# mutable config, not all .cfg files or any system payload. Kernel, initrd,
+# SquashFS and package manifest remain checked; whole-ISO/DD checks still
+# cover this config as well. This exception does not fix mangled boot keys:
+# media verification cannot run if rd.agnusos.live itself was rewritten.
+sudo /bin/bash -c 'find . -type f ! -name md5sum.txt ! -name bios.img ! -name efiboot.img ! -path ./isolinux/grub.cfg -print0 | xargs -0 md5sum > md5sum.txt'
+judge "Create md5sum.txt"
+
+print_ok "Creating iso image on $SCRIPT_DIR/$TARGET_NAME.iso (arch:$TARGET_ARCH)..."
+if [ "$TARGET_ARCH" = "amd64" ]; then
+    # amd64: hybrid ISO with BIOS (El Torito) + UEFI
+    sudo xorriso \
+        -as mkisofs \
+        -r -J \
+        -iso-level 3 \
+        -full-iso9660-filenames \
+        -volid "$LIVE_MEDIA_LABEL" \
+        -partition_offset 16 \
+        -eltorito-boot boot/grub/bios.img \
+            -no-emul-boot \
+            -boot-load-size 4 \
+            -boot-info-table \
+            --eltorito-catalog boot/grub/boot.cat \
+            --grub2-boot-info \
+            --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+        -eltorito-alt-boot \
+            -e EFI/efiboot.img \
+            -no-emul-boot \
+            -append_partition 2 0xef isolinux/efiboot.img \
+        -output "$SCRIPT_DIR/$TARGET_NAME.iso" \
+        -m "isolinux/efiboot.img" \
+        -m "isolinux/bios.img" \
+        -graft-points \
+            "/EFI/efiboot.img=isolinux/efiboot.img" \
+            "/boot/grub/grub.cfg=isolinux/grub.cfg" \
+            "/boot/grub/bios.img=isolinux/bios.img" \
+            "."
+else
+    # arm64: UEFI-only ISO — no BIOS, no El Torito, no hybrid MBR
+    sudo xorriso \
+        -as mkisofs \
+        -r -J \
+        -iso-level 3 \
+        -full-iso9660-filenames \
+        -volid "$LIVE_MEDIA_LABEL" \
+        -partition_offset 16 \
+        -e EFI/efiboot.img \
+        -no-emul-boot \
+        -append_partition 2 0xef isolinux/efiboot.img \
+        -appended_part_as_gpt \
+        -output "$SCRIPT_DIR/$TARGET_NAME.iso" \
+        -m "isolinux/efiboot.img" \
+        -graft-points \
+            "/EFI/efiboot.img=isolinux/efiboot.img" \
+            "/boot/grub/grub.cfg=isolinux/grub.cfg" \
+            "."
+fi
+
+judge "Create iso image"
+
+print_ok "Embedding the Dracut rd.live.check media checksum..."
+sudo implantisomd5 --force "$SCRIPT_DIR/$TARGET_NAME.iso"
+judge "Embed ISO media checksum"
+
+print_ok "Moving iso image to $SCRIPT_DIR/dist/$TARGET_BUSINESS_NAME-$TARGET_BUILD_VERSION-$DATE.iso..."
+mkdir -p "$SCRIPT_DIR/dist"
+mv "$SCRIPT_DIR/$TARGET_NAME.iso" "$SCRIPT_DIR/dist/$TARGET_BUSINESS_NAME-$TARGET_BUILD_VERSION-$DATE-$TARGET_ARCH.iso"
+judge "Move iso image"
+
+print_ok "Generating sha256 checksum..."
+HASH=$(sha256sum "$SCRIPT_DIR/dist/$TARGET_BUSINESS_NAME-$TARGET_BUILD_VERSION-$DATE-$TARGET_ARCH.iso" | cut -d ' ' -f 1)
+echo "SHA256: $HASH" > "$SCRIPT_DIR/dist/$TARGET_BUSINESS_NAME-$TARGET_BUILD_VERSION-$DATE-$TARGET_ARCH.sha256"
+judge "Generate sha256 checksum"
+
+popd
+}function umount_on_exit() {
+sleep 2
+print_ok "Unmounting filesystems before exit..."
+sudo umount "$SCRIPT_DIR/new_building_os/sys" || sudo umount -lf "$SCRIPT_DIR/new_building_os/sys" || true
+sudo umount "$SCRIPT_DIR/new_building_os/proc" || sudo umount -lf "$SCRIPT_DIR/new_building_os/proc" || true
+sudo umount "$SCRIPT_DIR/new_building_os/dev" || sudo umount -lf "$SCRIPT_DIR/new_building_os/dev" || true
+sudo umount "$SCRIPT_DIR/new_building_os/run" || sudo umount -lf "$SCRIPT_DIR/new_building_os/run" || true
+judge "Unmount filesystems before exit"
+}=============   main  ================if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+cd "$SCRIPT_DIR"
+bind_signal
+clean
+download_base_system
+mount_folders
+setup_apt
+run_chroot
+umount_folders
+prepare_iso_directory
+prepare_live_grub_font
+prepare_live_grub_theme
+build_iso
+echo "$0 - Build completed."
+fi
